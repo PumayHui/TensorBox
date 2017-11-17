@@ -1,4 +1,6 @@
+#python train.py --hypes hypes/lstm.json --weight output/lstm_2017_10_25_07.37/save.ckpt-700000 --gpu 0 --logdir output
 #!/usr/bin/env python
+#coding=utf-8
 import json
 import cv2
 import tensorflow.contrib.slim as slim
@@ -28,8 +30,20 @@ np.random.seed(0)
 
 from utils import train_utils, googlenet_load, tf_concat
 
-@ops.RegisterGradient("Hungarian")     
-def _hungarian_grad(op, *args):       
+def variable_summaries(var, name):
+    """Attach a lot of summaries to a Tensor."""
+    with tf.name_scope('summaries'):
+        mean = tf.reduce_mean(var)
+        tf.summary.scalar('mean/' + name, mean)
+        with tf.name_scope('stddev'):
+            stddev = tf.sqrt(tf.reduce_sum(tf.square(var - mean)))
+        tf.summary.scalar('sttdev/' + name, stddev)
+        tf.summary.scalar('max/' + name, tf.reduce_max(var))
+        tf.summary.scalar('min/' + name, tf.reduce_min(var))
+        tf.summary.histogram(name, var)
+
+@ops.RegisterGradient("Hungarian")
+def _hungarian_grad(op, *args):
     return map(array_ops.zeros_like, op.inputs)
 
 def build_overfeat_inner(H, lstm_input):
@@ -155,11 +169,11 @@ def build_forward(H, x, phase, reuse):
         cnn2 = cnn[:, :, :, 700:]
         cnn2 = tf.nn.avg_pool(cnn2, ksize=[1, pool_size, pool_size, 1],
                               strides=[1, 1, 1, 1], padding='SAME')
-        cnn = tf_concat(3, [cnn1, cnn2])  
+        cnn = tf_concat(3, [cnn1, cnn2])
     cnn = tf.reshape(cnn,
                      [H['batch_size'] * H['grid_width'] * H['grid_height'], H['later_feat_channels']])
     initializer = tf.random_uniform_initializer(-0.1, 0.1)
-    with tf.variable_scope('decoder', reuse=reuse, initializer=initializer):
+    with tf.variable_scope('overfeat_inner', reuse=reuse, initializer=initializer):
         scale_down = 0.01
         lstm_input = tf.reshape(cnn * scale_down, (H['batch_size'] * grid_size, H['later_feat_channels']))
         if H['use_lstm']:
@@ -243,7 +257,7 @@ def build_forward_backward(H, x, phase, boxes, flags):
          pred_confidences, pred_confs_deltas, pred_boxes_deltas) = build_forward(H, x, phase, reuse)
     else:
         pred_boxes, pred_logits, pred_confidences = build_forward(H, x, phase, reuse)
-    with tf.variable_scope('decoder', reuse={'train': None, 'test': True}[phase]):
+    with tf.variable_scope('backward', reuse={'train': None, 'test': True}[phase]):
         outer_boxes = tf.reshape(boxes, [outer_size, H['rnn_len'], 4])
         outer_flags = tf.cast(tf.reshape(flags, [outer_size, H['rnn_len']]), 'int32')
         if H['use_lstm']:
@@ -318,22 +332,30 @@ def build(H, q):
     print(gpu_options)
     config = tf.ConfigProto(gpu_options=gpu_options)
 
-    learning_rate = tf.placeholder(tf.float32)
+    learning_rate = tf.placeholder(tf.float32, name='leanrning_rate')
     if solver['opt'] == 'RMS':
         opt = tf.train.RMSPropOptimizer(learning_rate=learning_rate,
-                                        decay=0.9, epsilon=solver['epsilon'])
+                                        decay=0.9, epsilon=solver['epsilon'], name='RMSPropOptimizer')
     elif solver['opt'] == 'Adam':
         opt = tf.train.AdamOptimizer(learning_rate=learning_rate,
-                                        epsilon=solver['epsilon'])
+                                        epsilon=solver['epsilon'], name='AdamOptimizer')
     elif solver['opt'] == 'SGD':
-        opt = tf.train.GradientDescentOptimizer(learning_rate=learning_rate)
+        opt = tf.train.GradientDescentOptimizer(learning_rate=learning_rate, name='GradientDescentOptimizer')
     else:
         raise ValueError('Unrecognized opt type')
-    loss, accuracy, confidences_loss, boxes_loss = {}, {}, {}, {}
+    with tf.name_scope('loss'):
+        loss = {}
+    with tf.name_scope('accuracy'):
+        accuracy = {}
+    with tf.name_scope('confidences_loss'):
+        confidences_loss = {}
+    with tf.name_scope('boxes_loss'):
+        boxes_loss = {}
+
     for phase in ['train', 'test']:
         # generate predictions and losses from forward pass
         x, confidences, boxes = q[phase].dequeue_many(arch['batch_size'])
-        flags = tf.argmax(confidences, 3)
+        flags = tf.argmax(confidences, 3, name='flags')
 
 
         grid_size = H['grid_width'] * H['grid_height']
@@ -350,7 +372,7 @@ def build(H, q):
         accuracy[phase] = tf.reduce_mean(tf.cast(a, 'float32'), name=phase+'/accuracy')
 
         if phase == 'train':
-            global_step = tf.Variable(0, trainable=False)
+            global_step = tf.Variable(0, trainable=False, name='global_step')
 
             tvars = tf.trainable_variables()
             if H['clip_norm'] <= 0:
@@ -425,11 +447,13 @@ def train(H, test_images):
     H["grid_width"] = H["image_width"] / H["region_size"]
     H["grid_height"] = H["image_height"] / H["region_size"]
 
-    x_in = tf.placeholder(tf.float32)
-    confs_in = tf.placeholder(tf.float32)
-    boxes_in = tf.placeholder(tf.float32)
+    x_in = tf.placeholder(tf.float32, name='images')
+    confs_in = tf.placeholder(tf.float32, name='confs')
+    boxes_in = tf.placeholder(tf.float32, name='boxes')
+
     q = {}
     enqueue_op = {}
+
     for phase in ['train', 'test']:
         dtypes = [tf.float32, tf.float32, tf.float32]
         grid_size = H['grid_width'] * H['grid_height']
@@ -438,7 +462,11 @@ def train(H, test_images):
             [grid_size, H['rnn_len'], H['num_classes']],
             [grid_size, H['rnn_len'], 4],
             )
-        q[phase] = tf.FIFOQueue(capacity=30, dtypes=dtypes, shapes=shapes)
+        # q[phase] = tf.FIFOQueue(capacity=30, dtypes=dtypes, shapes=shapes)
+        if phase == 'train':
+            q[phase] = tf.FIFOQueue(capacity=30, dtypes=dtypes, shapes=shapes, name='q_train')
+        else:
+            q[phase] = tf.FIFOQueue(capacity=30, dtypes=dtypes, shapes=shapes, name='q_test')
         enqueue_op[phase] = q[phase].enqueue((x_in, confs_in, boxes_in))
 
     def make_feed(d):
@@ -493,7 +521,7 @@ def train(H, test_images):
 
         # train model for N iterations
         start = time.time()
-        max_iter = H['solver'].get('max_iter', 10000000)
+        max_iter = H['solver'].get('max_iter', 100000)
         for i in xrange(max_iter):
             display_iter = H['logging']['display_iter']
             adjusted_lr = (H['solver']['learning_rate'] *
